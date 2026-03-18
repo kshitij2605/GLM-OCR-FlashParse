@@ -51,6 +51,11 @@ class _AsyncPipelineState:
     count_lock: threading.Lock
     exceptions: List[Tuple[str, Exception]]
     exception_lock: threading.Lock
+    # Per-page completion tracking for streaming callbacks
+    page_callback: Optional[Any] = None
+    page_region_done_count: Optional[Dict[int, int]] = None
+    page_done_set: Optional[set] = None
+    page_done_lock: Optional[threading.Lock] = None
 
 
 class Pipeline:
@@ -153,6 +158,7 @@ class Pipeline:
         layout_vis_output_dir: Optional[str] = None,
         page_maxsize: Optional[int] = None,
         region_maxsize: Optional[int] = None,
+        page_callback: Optional[Any] = None,
     ) -> Generator[PipelineResult, None, None]:
         """Process request with async three-stage flow; yield one result per input unit.
 
@@ -167,6 +173,10 @@ class Pipeline:
             region_maxsize: Max size for region_queue (region-level items). Should be
                 larger than page_maxsize since one page yields many regions.
                 Defaults to page_maxsize * 8 if not set.
+            page_callback: Optional callback ``fn(page_idx, page_regions, page_image)``
+                invoked from the recognition thread as soon as all regions for a page
+                are recognised. Enables downstream consumers to start processing
+                individual pages before the entire document is done.
 
         Yields:
             PipelineResult per input URL (one image or one PDF).
@@ -302,6 +312,11 @@ class Pipeline:
             return
 
         state = self._create_async_pipeline_state(page_maxsize, region_maxsize)
+        if page_callback is not None:
+            state.page_callback = page_callback
+            state.page_region_done_count = {}
+            state.page_done_set = set()
+            state.page_done_lock = threading.Lock()
 
         def data_loading_thread() -> None:
             try:
@@ -432,6 +447,34 @@ class Pipeline:
                         state.ready_units_queue.put(u)
                         state.units_put.add(u)
 
+        def maybe_notify_page_done(page_idx: int) -> None:
+            """Fire page_callback when all regions for a page are recognised."""
+            if state.page_callback is None:
+                return
+            fire = False
+            with state.page_done_lock:
+                state.page_region_done_count[page_idx] = (
+                    state.page_region_done_count.get(page_idx, 0) + 1
+                )
+                total = len(state.layout_results_dict.get(page_idx, []))
+                if (
+                    total > 0
+                    and state.page_region_done_count[page_idx] >= total
+                    and page_idx not in state.page_done_set
+                ):
+                    state.page_done_set.add(page_idx)
+                    fire = True
+            if fire:
+                with state.results_lock:
+                    page_results = [
+                        r for (i, r) in state.recognition_results if i == page_idx
+                    ]
+                page_image = state.images_dict.get(page_idx)
+                try:
+                    state.page_callback(page_idx, page_results, page_image)
+                except Exception as e:
+                    logger.warning("page_callback error for page %d: %s", page_idx, e)
+
         def vlm_recognition_thread() -> None:
             try:
                 executor = ThreadPoolExecutor(max_workers=min(self.max_workers, 128))
@@ -456,6 +499,7 @@ class Pipeline:
                             with state.results_lock:
                                 state.recognition_results.append((page_idx, info))
                             maybe_notify_ready_units(page_idx)
+                            maybe_notify_page_done(page_idx)
                     try:
                         item_type, img_idx, data = state.region_queue.get(timeout=0.01)
                     except queue.Empty:
@@ -465,6 +509,7 @@ class Pipeline:
                                 with state.results_lock:
                                     state.recognition_results.append((page_idx, region))
                                 maybe_notify_ready_units(page_idx)
+                                maybe_notify_page_done(page_idx)
                             break
                         if futures:
                             done_list = [f for f in futures.keys() if f.done()]
@@ -477,7 +522,15 @@ class Pipeline:
                     if item_type == "region":
                         cropped_image, region, task_type, page_idx = data
                         if task_type == "skip":
-                            pending_skip.append((region, task_type, page_idx))
+                            if state.page_callback is not None:
+                                # Process immediately so page completion is detected
+                                region["content"] = None
+                                with state.results_lock:
+                                    state.recognition_results.append((page_idx, region))
+                                maybe_notify_ready_units(page_idx)
+                                maybe_notify_page_done(page_idx)
+                            else:
+                                pending_skip.append((region, task_type, page_idx))
                         else:
                             req = self.page_loader.build_request_from_image(
                                 cropped_image, task_type
@@ -505,11 +558,23 @@ class Pipeline:
                         with state.results_lock:
                             state.recognition_results.append((page_idx, info))
                         maybe_notify_ready_units(page_idx)
+                        maybe_notify_page_done(page_idx)
                 executor.shutdown(wait=True)
+                # Signal that all pages are done
+                if state.page_callback is not None:
+                    try:
+                        state.page_callback(None, None, None)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.exception("VLM recognition thread error: %s", e)
                 with state.exception_lock:
                     state.exceptions.append(("VLMRecognitionThread", e))
+                if state.page_callback is not None:
+                    try:
+                        state.page_callback(None, None, None)
+                    except Exception:
+                        pass
 
         t1 = threading.Thread(target=data_loading_thread, daemon=True)
         t2 = threading.Thread(target=layout_detection_thread, daemon=True)
