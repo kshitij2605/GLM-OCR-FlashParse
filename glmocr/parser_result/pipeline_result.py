@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import shutil
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from glmocr.utils.logging import get_logger
 
@@ -27,6 +27,7 @@ class PipelineResult(BaseParserResult):
         original_images: List[str],
         layout_vis_dir: Optional[str] = None,
         layout_image_indices: Optional[List[int]] = None,
+        page_images: Optional[Dict[int, Any]] = None,
     ):
         """Initialize.
 
@@ -37,6 +38,9 @@ class PipelineResult(BaseParserResult):
             layout_vis_dir: Temp dir with layout_page{N}.jpg (optional).
             layout_image_indices: Indices of layout pages belonging to this unit;
                 None means all files in layout_vis_dir belong to this unit.
+            page_images: Rendered page images (PIL) keyed by page index. Allows
+                downstream consumers to reuse the images already rendered by the
+                pipeline instead of re-rendering the source document.
         """
         super().__init__(
             json_result=json_result,
@@ -45,6 +49,7 @@ class PipelineResult(BaseParserResult):
         )
         self.layout_vis_dir = layout_vis_dir
         self.layout_image_indices = layout_image_indices
+        self.page_images = page_images
         self._layout_vis_saved = False
 
     def save(

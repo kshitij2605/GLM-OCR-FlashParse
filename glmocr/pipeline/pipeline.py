@@ -535,6 +535,7 @@ class Pipeline:
                     markdown_result=empty_md,
                     original_images=[original_inputs[u]],
                     layout_vis_dir=layout_vis_output_dir,
+                    page_images=dict(state.images_dict),
                 )
             t3.join()
             with state.exception_lock:
@@ -601,6 +602,7 @@ class Pipeline:
                 original_images=[original_inputs[u]],
                 layout_vis_dir=layout_vis_output_dir,
                 layout_image_indices=unit_image_indices[u],
+                page_images=dict(state.images_dict),
             )
             emitted.add(u)
 
