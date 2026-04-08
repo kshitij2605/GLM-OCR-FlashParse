@@ -211,7 +211,7 @@ class OCRClient:
                                 data=json.dumps(test_payload),
                                 timeout=30,
                                 verify=self.verify_ssl,
-                                proxies={"http": None, "https": None},
+                                proxies={"http": "", "https": ""},
                             )
                             if response.status_code == 200:
                                 logger.debug(
