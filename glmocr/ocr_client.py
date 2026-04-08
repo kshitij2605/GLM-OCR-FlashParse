@@ -101,6 +101,7 @@ class OCRClient:
     def _make_session(self) -> requests.Session:
         """Create a Session with a larger connection pool for concurrent use."""
         session = requests.Session()
+        session.trust_env = False
         adapter = HTTPAdapter(
             pool_connections=1,  # single API host
             pool_maxsize=self._pool_maxsize,
@@ -210,6 +211,7 @@ class OCRClient:
                                 data=json.dumps(test_payload),
                                 timeout=30,
                                 verify=self.verify_ssl,
+                                proxies={"http": None, "https": None},
                             )
                             if response.status_code == 200:
                                 logger.debug(

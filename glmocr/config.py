@@ -43,6 +43,8 @@ _ENV_MAP: Dict[str, str] = {
     "OCR_API_KEY": "pipeline.ocr_api.api_key",
     "OCR_API_HOST": "pipeline.ocr_api.api_host",
     "OCR_API_PORT": "pipeline.ocr_api.api_port",
+    "API_HOST": "pipeline.ocr_api.api_host",
+    "API_PORT": "pipeline.ocr_api.api_port",
     "OCR_MODEL": "pipeline.ocr_api.model",
     # Layout
     "ENABLE_LAYOUT": "pipeline.enable_layout",
