@@ -126,6 +126,15 @@ class Pipeline:
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
 
+        # Concurrency locks — allow multiple process() calls on the same
+        # Pipeline instance while serializing the non-thread-safe parts.
+        # PDFium (pypdfium2) crashes at the C level when two threads render
+        # pages concurrently, even with separate PdfDocument handles.
+        self._pdf_lock = threading.Lock()
+        # PyTorch layout detector model is not thread-safe for concurrent
+        # forward passes on the same instance.
+        self._layout_lock = threading.Lock()
+
     def _create_async_pipeline_state(
         self,
         page_maxsize: Optional[int],
@@ -322,15 +331,20 @@ class Pipeline:
             try:
                 img_idx = 0
                 unit_indices_list: List[int] = []
-                for page, unit_idx in self.page_loader.iter_pages_with_unit_indices(
-                    image_urls
-                ):
-                    state.images_dict[img_idx] = page
-                    state.page_queue.put(("image", img_idx, page))
-                    unit_indices_list.append(unit_idx)
-                    img_idx += 1
-                    state.num_images_loaded[0] = img_idx
-                    state.unit_indices_holder[0] = list(unit_indices_list)
+                # Serialize PDFium access — the C library crashes when two
+                # threads render pages concurrently, even with separate
+                # PdfDocument handles.  The lock is held for the full
+                # iteration so the document stays open without contention.
+                with self._pdf_lock:
+                    for page, unit_idx in self.page_loader.iter_pages_with_unit_indices(
+                        image_urls
+                    ):
+                        state.images_dict[img_idx] = page
+                        state.page_queue.put(("image", img_idx, page))
+                        unit_indices_list.append(unit_idx)
+                        img_idx += 1
+                        state.num_images_loaded[0] = img_idx
+                        state.unit_indices_holder[0] = list(unit_indices_list)
                 state.page_queue.put(("done", None, None))
             except Exception as e:
                 logger.exception("Data loading thread error: %s", e)
@@ -688,12 +702,15 @@ class Pipeline:
         global_start_idx: int,
     ) -> None:
         """Run layout detection on a batch and push regions to queue2."""
-        layout_results = self.layout_detector.process(
-            batch_images,
-            save_visualization=save_visualization and vis_output_dir is not None,
-            visualization_output_dir=vis_output_dir,
-            global_start_idx=global_start_idx,
-        )
+        # Serialize layout detector access — PyTorch model inference is not
+        # thread-safe for concurrent forward passes on the same instance.
+        with self._layout_lock:
+            layout_results = self.layout_detector.process(
+                batch_images,
+                save_visualization=save_visualization and vis_output_dir is not None,
+                visualization_output_dir=vis_output_dir,
+                global_start_idx=global_start_idx,
+            )
         for img_idx, image, layout_result in zip(
             batch_indices, batch_images, layout_results
         ):
