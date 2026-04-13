@@ -145,13 +145,12 @@ class Pipeline:
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
 
-        # PDFium document lifecycle (open, load page, close) is not thread-safe
-        # even with separate PdfDocument handles — global module/codec state
-        # is shared.  Rendering (FPDF_RenderPageBitmap) is thread-safe with
-        # the patched PDFium (per-face mutex, glyph cache mutex, etc.), but
-        # since the page_loader interleaves load + render in a generator, we
-        # must serialize the entire iteration.
-        self._pdf_lock = threading.Lock()
+        # PDFium is fully thread-safe with the patched build:
+        # - Atomic reference counting (Retainable::ref_count_)
+        # - Thread-safe Observable (observer set mutex)
+        # - Thread-local parser recursion depth
+        # - Per-face mutex, glyph cache mutex, FontMapper mutex
+        # No _pdf_lock needed — concurrent document operations are safe.
 
     def _create_async_pipeline_state(
         self,
@@ -349,16 +348,15 @@ class Pipeline:
             try:
                 img_idx = 0
                 unit_indices_list: List[int] = []
-                with self._pdf_lock:
-                    for page, unit_idx in self.page_loader.iter_pages_with_unit_indices(
-                        image_urls
-                    ):
-                        state.images_dict[img_idx] = page
-                        state.page_queue.put(("image", img_idx, page))
-                        unit_indices_list.append(unit_idx)
-                        img_idx += 1
-                        state.num_images_loaded[0] = img_idx
-                        state.unit_indices_holder[0] = list(unit_indices_list)
+                for page, unit_idx in self.page_loader.iter_pages_with_unit_indices(
+                    image_urls
+                ):
+                    state.images_dict[img_idx] = page
+                    state.page_queue.put(("image", img_idx, page))
+                    unit_indices_list.append(unit_idx)
+                    img_idx += 1
+                    state.num_images_loaded[0] = img_idx
+                    state.unit_indices_holder[0] = list(unit_indices_list)
                 state.page_queue.put(("done", None, None))
             except Exception as e:
                 logger.exception("Data loading thread error: %s", e)
