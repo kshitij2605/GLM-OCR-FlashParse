@@ -110,30 +110,48 @@ class Pipeline:
             self.result_formatter = ResultFormatter(config.result_formatter)
 
         # Layout detector (initialized only when enabled)
+        self._layout_lock = None  # Only set for PyTorch backend
         if self.enable_layout:
             if layout_detector is not None:
                 self.layout_detector = layout_detector
             else:
-                from glmocr.layout import PPDocLayoutDetector
+                # Try ONNX backend first (thread-safe, ~30% faster)
+                try:
+                    from glmocr.layout.onnx_layout_detector import (
+                        PPDocLayoutDetectorONNX,
+                    )
+                    import onnxruntime  # noqa: F401
 
-                if PPDocLayoutDetector is None:
-                    from glmocr.layout import _raise_layout_import_error
+                    self.layout_detector = PPDocLayoutDetectorONNX(config.layout)
+                    logger.info("Using ONNX Runtime layout detector")
+                except (ImportError, Exception) as e:
+                    logger.info(
+                        "ONNX layout detector unavailable (%s), "
+                        "falling back to PyTorch",
+                        e,
+                    )
+                    from glmocr.layout import PPDocLayoutDetector
 
-                    _raise_layout_import_error()
+                    if PPDocLayoutDetector is None:
+                        from glmocr.layout import _raise_layout_import_error
 
-                self.layout_detector = PPDocLayoutDetector(config.layout)
+                        _raise_layout_import_error()
+
+                    self.layout_detector = PPDocLayoutDetector(config.layout)
+                    # PyTorch model is not thread-safe for concurrent
+                    # forward passes on the same instance.
+                    self._layout_lock = threading.Lock()
             self.max_workers = config.max_workers
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
 
-        # Concurrency locks — allow multiple process() calls on the same
-        # Pipeline instance while serializing the non-thread-safe parts.
-        # PDFium (pypdfium2) crashes at the C level when two threads render
-        # pages concurrently, even with separate PdfDocument handles.
+        # PDFium document lifecycle (open, load page, close) is not thread-safe
+        # even with separate PdfDocument handles — global module/codec state
+        # is shared.  Rendering (FPDF_RenderPageBitmap) is thread-safe with
+        # the patched PDFium (per-face mutex, glyph cache mutex, etc.), but
+        # since the page_loader interleaves load + render in a generator, we
+        # must serialize the entire iteration.
         self._pdf_lock = threading.Lock()
-        # PyTorch layout detector model is not thread-safe for concurrent
-        # forward passes on the same instance.
-        self._layout_lock = threading.Lock()
 
     def _create_async_pipeline_state(
         self,
@@ -331,10 +349,6 @@ class Pipeline:
             try:
                 img_idx = 0
                 unit_indices_list: List[int] = []
-                # Serialize PDFium access — the C library crashes when two
-                # threads render pages concurrently, even with separate
-                # PdfDocument handles.  The lock is held for the full
-                # iteration so the document stays open without contention.
                 with self._pdf_lock:
                     for page, unit_idx in self.page_loader.iter_pages_with_unit_indices(
                         image_urls
@@ -702,9 +716,16 @@ class Pipeline:
         global_start_idx: int,
     ) -> None:
         """Run layout detection on a batch and push regions to queue2."""
-        # Serialize layout detector access — PyTorch model inference is not
-        # thread-safe for concurrent forward passes on the same instance.
-        with self._layout_lock:
+        # ONNX Runtime backend is thread-safe; PyTorch needs a lock.
+        if self._layout_lock is not None:
+            with self._layout_lock:
+                layout_results = self.layout_detector.process(
+                    batch_images,
+                    save_visualization=save_visualization and vis_output_dir is not None,
+                    visualization_output_dir=vis_output_dir,
+                    global_start_idx=global_start_idx,
+                )
+        else:
             layout_results = self.layout_detector.process(
                 batch_images,
                 save_visualization=save_visualization and vis_output_dir is not None,
