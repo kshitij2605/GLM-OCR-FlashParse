@@ -1,6 +1,7 @@
 """Visualization utilities for layout detection and other tasks."""
 
 from typing import List, Dict, Tuple
+import functools
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
@@ -116,6 +117,7 @@ def font_colormap(color_index: int) -> Tuple[int, int, int]:
         return dark
 
 
+@functools.lru_cache(maxsize=16)
 def get_default_font(font_size: int = 20) -> ImageFont.FreeTypeFont:
     """Get default font for text rendering.
 
@@ -381,4 +383,4 @@ def save_layout_visualization(
     os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
     # Save image
-    vis_img.save(save_path, quality=95)
+    vis_img.save(save_path, quality=65)

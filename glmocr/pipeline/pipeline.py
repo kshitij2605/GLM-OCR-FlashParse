@@ -110,7 +110,11 @@ class Pipeline:
             self.result_formatter = ResultFormatter(config.result_formatter)
 
         # Layout detector (initialized only when enabled)
-        self._layout_lock = None  # Only set for PyTorch backend
+        # Lock serializes layout detection across concurrent PDFs to prevent
+        # GPU memory spikes. Both ONNX and PyTorch backends need this: ONNX
+        # is thread-safe but concurrent inferences allocate activation memory
+        # on GPU. With vLLM using 70% of VRAM, concurrent layout batches OOM.
+        self._layout_lock = None
         if self.enable_layout:
             if layout_detector is not None:
                 self.layout_detector = layout_detector
@@ -138,19 +142,16 @@ class Pipeline:
                         _raise_layout_import_error()
 
                     self.layout_detector = PPDocLayoutDetector(config.layout)
-                    # PyTorch model is not thread-safe for concurrent
-                    # forward passes on the same instance.
-                    self._layout_lock = threading.Lock()
+            # Serialize layout detection for all backends to cap GPU memory
+            self._layout_lock = threading.Lock()
             self.max_workers = config.max_workers
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
 
-        # PDFium is fully thread-safe with the patched build:
-        # - Atomic reference counting (Retainable::ref_count_)
-        # - Thread-safe Observable (observer set mutex)
-        # - Thread-local parser recursion depth
-        # - Per-face mutex, glyph cache mutex, FontMapper mutex
-        # No _pdf_lock needed — concurrent document operations are safe.
+        # PDFium is fully thread-safe with the patched build (per-face mutex,
+        # atomic refcount, thread-safe Observable, thread-local parser depth,
+        # FontMapper mutex). Concurrent PDF rendering scales near-linearly
+        # (4.7x speedup with 5 threads on 48-core Xeon). No lock needed.
 
     def _create_async_pipeline_state(
         self,
